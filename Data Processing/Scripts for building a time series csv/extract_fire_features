@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""
+extract_fire_features.py
+
+For each California wildfire (2001-2024) in the perimeters GeoPackage,
+extract environmental features for training a wildfire growth / size
+prediction model.
+"""
+
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import xarray as xr
+import rasterio
+from rasterio.mask import mask as rio_mask
+from rasterio.merge import merge as rio_merge
+from rasterio.warp import transform_bounds, transform_geom
+from rasterio.crs import CRS
+from rasterio.io import MemoryFile
+from shapely.geometry import box, mapping
+from tqdm import tqdm
+
+warnings.filterwarnings("ignore")
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+BASE = Path("/Volumes/Extreme SSD/STA 141B Final")
+
+PERIMETERS_PATH = BASE / "Fire Perimeters/California_Historic_Fire_Perimeters_586217350401785615.gpkg"
+TOPO_DIR        = BASE / "Topography/tiles"
+VEG_DIRS        = [
+    BASE / "Vegetation/Annual_NLCD_LndCov_1995-2004_CU_C1V1",
+    BASE / "Vegetation/Annual_NLCD_LndCov_2005-2014_CU_C1V1",
+    BASE / "Vegetation/Annual_NLCD_LndCov_2015-2024_CU_C1V1",
+]
+GRIDMET_DIR = BASE / "GridMET"
+OUTPUT_CSV  = BASE / "SCRIPTS/fire_features.csv"
+
+CRS_4326 = CRS.from_epsg(4326)
+
+# ── GridMET variable registry ──────────────────────────────────────────────────
+# prefix (subfolder name, NetCDF variable name)
+GRIDMET_VARS = {
+    "bi":     ("Burning Index",              "burning_index_g"),
+    "erc":    ("Energy Release Component",   "energy_release_component-g"),
+    "fm100":  ("Fuel Moisture (100 hours)",  "dead_fuel_moisture_100hr"),
+    "fm1000": ("Fuel Moisture (1000 hours)", "dead_fuel_moisture_1000hr"),
+    "tmmx":   ("Max Air Temperature",        "air_temperature"),
+    "tmmn":   ("Min Air Temperature",        "air_temperature"),
+    "rmax":   ("Max Humidity",               "relative_humidity"),
+    "rmin":   ("Min Humidity",               "relative_humidity"),
+    "pr":     ("Precipitation",              "precipitation_amount"),
+    "vpd":    ("Vapor Pressure Deficit",     "mean_vapor_pressure_deficit"),
+    "vs":     ("Wind Speed",                 "wind_speed"),
+}
+
+# ── NLCD land-cover classes ────────────────────────────────────────────────────
+NLCD_CLASSES = {
+    11: "open_water",
+    21: "dev_open",
+    22: "dev_low",
+    23: "dev_med",
+    24: "dev_high",
+    31: "barren",
+    41: "forest_decid",
+    42: "forest_ever",
+    43: "forest_mixed",
+    52: "shrub",
+    71: "grassland",
+    81: "pasture",
+    82: "crops",
+    90: "wetland_woody",
+    95: "wetland_herb",
+}
+
+
+# ── Build indexes ────────────────────────────────────────────────
+
+def build_topo_index() -> list[tuple[Path, tuple]]:
+    """Return [(path, bounds_in_epsg4326), ...] for each DEM tile."""
+    tiles = []
+    for f in sorted(TOPO_DIR.glob("*.tif")):
+        with rasterio.open(f) as src:
+            b4326 = transform_bounds(src.crs, CRS_4326, *src.bounds)
+        tiles.append((f, b4326))
+    return tiles
+
+
+def build_nlcd_index() -> dict[int, Path]:
+    """Return {year: path} for every annual NLCD .tif found."""
+    index: dict[int, Path] = {}
+    for d in VEG_DIRS:
+        for f in d.glob("*.tif"):
+            if f.name.startswith("._"):
+                continue
+            for part in f.stem.split("_"):
+                if part.isdigit() and len(part) == 4:
+                    index[int(part)] = f
+                    break
+    return index
+
+
+# ── Topography features ────────────────────────────────────────────────────────
+
+def extract_topo(fire_geom_4326, topo_tiles: list) -> dict:
+    """Compute elevation mean/std and approximate slope mean within fire boundary."""
+    empty = dict(elev_mean=np.nan, elev_std=np.nan, slope_mean=np.nan)
+    fire_box = box(*fire_geom_4326.bounds)
+
+    # Find which DEM tiles intersect the fire
+    matching = [p for (p, b) in topo_tiles if fire_box.intersects(box(*b))]
+    if not matching:
+        return empty
+
+    try:
+        srcs = [rasterio.open(p) for p in matching]
+        topo_crs = srcs[0].crs
+
+        if len(srcs) == 1:
+            geom_topo = transform_geom(CRS_4326, topo_crs, mapping(fire_geom_4326))
+            data, _ = rio_mask(srcs[0], [geom_topo], crop=True, nodata=np.nan)
+            elev = data[0].astype(float)
+        else:
+            mosaic, mosaic_tf = rio_merge(srcs)
+            with MemoryFile() as memfile:
+                with memfile.open(
+                    driver="GTiff",
+                    height=mosaic.shape[1], width=mosaic.shape[2],
+                    count=1, dtype=mosaic.dtype,
+                    crs=topo_crs, transform=mosaic_tf,
+                    nodata=np.nan,
+                ) as ds:
+                    ds.write(mosaic)
+                with memfile.open() as ds:
+                    geom_topo = transform_geom(CRS_4326, topo_crs, mapping(fire_geom_4326))
+                    data, _ = rio_mask(ds, [geom_topo], crop=True, nodata=np.nan)
+            elev = data[0].astype(float)
+
+        for s in srcs:
+            s.close()
+
+        valid = elev[np.isfinite(elev)]
+        if len(valid) == 0:
+            return empty
+
+        # Approximate slope (using the method from Horn)
+        dy, dx = np.gradient(elev)
+        slope = np.sqrt(dx**2 + dy**2)
+
+        return dict(
+            elev_mean=float(np.nanmean(valid)),
+            elev_std=float(np.nanstd(valid)),
+            slope_mean=float(np.nanmean(slope[np.isfinite(slope)])),
+        )
+    except Exception:
+        return empty
+
+
+# ── Vegetation features ────────────────────────────────────────────────────────
+
+def extract_vegetation(fire_geom_4326, year: int, nlcd_index: dict) -> dict:
+    """Compute % coverage of each NLCD land-cover class within fire boundary."""
+    result = {f"nlcd_{name}": 0.0 for name in NLCD_CLASSES.values()}
+
+    available = sorted(nlcd_index.keys())
+    if not available:
+        return result
+    # Use the closest available NLCD year
+    nlcd_year = min(available, key=lambda y: abs(y - year))
+    nlcd_path = nlcd_index[nlcd_year]
+
+    try:
+        with rasterio.open(nlcd_path) as src:
+            nodata_val = src.nodata
+            nlcd_crs   = src.crs
+            geom_nlcd  = transform_geom(CRS_4326, nlcd_crs, mapping(fire_geom_4326))
+            data, _    = rio_mask(src, [geom_nlcd], crop=True,
+                                  nodata=nodata_val, all_touched=True)
+
+        arr   = data[0]
+        valid = arr[(arr != nodata_val) & (arr < 250) & (arr > 0)]
+        if len(valid) == 0:
+            return result
+
+        for code, name in NLCD_CLASSES.items():
+            result[f"nlcd_{name}"] = float(np.sum(valid == code) / len(valid))
+    except Exception:
+        pass
+
+    return result
+
+
+# ── Weather features ───────────────────────────────────────────────────────────
+
+def _spatial_subset(da, minx, miny, maxx, maxy, pad=0.05):
+    """Subset a GridMET DataArray to a bounding box."""
+    return da.sel(
+        lat=slice(maxy + pad, miny - pad),
+        lon=slice(minx - pad, maxx + pad),
+    )
+
+
+def extract_gridmet(bounds_4326: tuple, alarm_date: pd.Timestamp,
+                    cont_date: pd.Timestamp) -> dict:
+    """
+    Extract weather stats from GridMET for fire bounding box + date range.
+    Returns {prefix_mean, prefix_max, prefix_day1} for each variable.
+
+    UPDATE: this now Handles fires that span a year boundary... 
+    """
+    minx, miny, maxx, maxy = bounds_4326
+    pad = 0.05  # degrees — ensures at least one cell even for tiny fires
+    results: dict = {}
+    spans_new_year = cont_date.year > alarm_date.year
+
+    for prefix, (folder, var_name) in GRIDMET_VARS.items():
+        keys = [f"{prefix}_mean", f"{prefix}_max", f"{prefix}_day1"]
+
+        nc_year1 = GRIDMET_DIR / folder / f"{prefix}_{alarm_date.year}.nc"
+        nc_year2 = GRIDMET_DIR / folder / f"{prefix}_{cont_date.year}.nc"
+
+        if not nc_year1.exists():
+            results.update({k: np.nan for k in keys})
+            continue
+
+        try:
+            ds1 = xr.open_dataset(nc_year1)
+            spatial1 = _spatial_subset(ds1[var_name], minx, miny, maxx, maxy, pad)
+
+            if spatial1.size == 0:
+                results.update({k: np.nan for k in keys})
+                ds1.close()
+                continue
+
+            # Ignition-day value (always in year 1)
+            day1_da  = spatial1.sel(day=str(alarm_date.date()), method="nearest")
+            day1_val = float(np.nanmean(day1_da.values))
+
+            # Build the full period DataArray
+            period1 = spatial1.sel(
+                day=slice(str(alarm_date.date()), f"{alarm_date.year}-12-31")
+            )
+
+            if spans_new_year and nc_year2.exists():
+                ds2 = xr.open_dataset(nc_year2)
+                spatial2 = _spatial_subset(ds2[var_name], minx, miny, maxx, maxy, pad)
+                period2  = spatial2.sel(
+                    day=slice(f"{cont_date.year}-01-01", str(cont_date.date()))
+                )
+                period = xr.concat([period1, period2], dim="day")
+                ds2.close()
+            else:
+                period = period1
+
+            ds1.close()
+
+            if period.size == 0:
+                period_mean = day1_val
+                period_max  = day1_val
+            else:
+                vals = period.values
+                period_mean = float(np.nanmean(vals))
+                period_max  = float(np.nanmax(vals))
+
+            results[f"{prefix}_mean"] = period_mean
+            results[f"{prefix}_max"]  = period_max
+            results[f"{prefix}_day1"] = day1_val
+
+        except Exception:
+            results.update({k: np.nan for k in keys})
+
+    return results
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+def main():
+    print("Loading fire perimeters …")
+    gdf = gpd.read_file(PERIMETERS_PATH)
+
+    # Filter: California, 2001-2024, valid alarm date, at least 1 acre
+    gdf = gdf[
+        (gdf["STATE"] == "CA")
+        & (gdf["YEAR_"] >= 2001)
+        & (gdf["YEAR_"] <= 2024)
+        & gdf["ALARM_DATE"].notna()
+        & (gdf["GIS_ACRES"] >= 1)
+    ].copy()
+    print(f"  {len(gdf)} fires after filtering")
+
+    # Parse dates 
+    gdf["ALARM_DATE"] = pd.to_datetime(gdf["ALARM_DATE"], utc=True).dt.tz_localize(None)
+    gdf["CONT_DATE"]  = pd.to_datetime(gdf["CONT_DATE"],  utc=True, errors="coerce").dt.tz_localize(None)
+    gdf["CONT_DATE"]  = gdf["CONT_DATE"].fillna(gdf["ALARM_DATE"] + pd.Timedelta(days=1))
+    gdf["duration_days"] = (gdf["CONT_DATE"] - gdf["ALARM_DATE"]).dt.days.clip(lower=1)
+
+    # Reproject to WGS 84 for geographic lookups
+    gdf = gdf.to_crs(CRS_4326)
+
+    print("Building topography index …")
+    topo_tiles = build_topo_index()
+    print(f"  {len(topo_tiles)} DEM tiles indexed")
+
+    print("Building NLCD vegetation index …")
+    nlcd_index = build_nlcd_index()
+    print(f"  NLCD years available: {sorted(nlcd_index.keys())}")
+
+    records = []
+    for _, row in tqdm(gdf.iterrows(), total=len(gdf), desc="Extracting features"):
+        geom = row.geometry
+        if geom is None or geom.is_empty:
+            continue
+
+        alarm = row["ALARM_DATE"]
+        cont  = row["CONT_DATE"]
+        year  = int(row["YEAR_"])
+
+        record: dict = {
+            "fire_name":     row["FIRE_NAME"],
+            "year":          year,
+            "alarm_date":    alarm.date(),
+            "cont_date":     cont.date(),
+            "duration_days": int(row["duration_days"]),
+            "gis_acres":     float(row["GIS_ACRES"]),
+            "cause":         row["CAUSE"],
+            "lon_centroid":  float(geom.centroid.x),
+            "lat_centroid":  float(geom.centroid.y),
+        }
+
+        record.update(extract_topo(geom, topo_tiles))
+        record.update(extract_vegetation(geom, year, nlcd_index))
+        record.update(extract_gridmet(geom.bounds, alarm, cont))
+
+        records.append(record)
+
+    df = pd.DataFrame(records)
+    OUTPUT_CSV.parent.mkdir(exist_ok=True)
+    df.to_csv(OUTPUT_CSV, index=False)
+
+    print(f"\nDone — {len(df)} rows saved to:\n  {OUTPUT_CSV}")
+    print("\nColumn summary:")
+    print(df.describe(include="all").T[["count", "mean", "std"]].to_string())
+
+
+if __name__ == "__main__":
+    main()
