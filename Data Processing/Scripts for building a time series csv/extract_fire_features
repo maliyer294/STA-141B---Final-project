@@ -3,7 +3,7 @@
 extract_fire_features.py
 
 For each California wildfire (2001-2024) in the perimeters GeoPackage,
-extract environmental features for training a wildfire growth / size
+extract environmental features for training our wildfire growth / size
 prediction model.
 """
 
@@ -79,7 +79,6 @@ NLCD_CLASSES = {
 # ── Build indexes ────────────────────────────────────────────────
 
 def build_topo_index() -> list[tuple[Path, tuple]]:
-    """Return [(path, bounds_in_epsg4326), ...] for each DEM tile."""
     tiles = []
     for f in sorted(TOPO_DIR.glob("*.tif")):
         with rasterio.open(f) as src:
@@ -100,7 +99,6 @@ def build_nlcd_index() -> dict[int, Path]:
                     index[int(part)] = f
                     break
     return index
-
 
 # ── Topography features ────────────────────────────────────────────────────────
 
