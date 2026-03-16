@@ -32,28 +32,35 @@ The dataset contains **7,662 California wildfires from 2001–2024**.
 | [metadata.csv](https://drive.google.com/file/d/1MviuW0CT_GHBzK1wInWNer-Jub9Pb9Rb/view?usp=sharing)           | One row per fire — static attributes only (29 columns)       |
 
 See the [Data Dictionary](https://github.com/maliyer294/STA-141B---Final-project/blob/main/Data%20Processing/WILDFIRE%20Data%20Dictionary%20(1).pdf) in `Data Processing/` for a full 
-description of every column.
+description of every variable.
 
 **Key columns:**
 - `fire_id` — unique identifier, links metadata to time series (e.g. `DIXIE_2021_01104`)
 - `days_to_ignition` — time axis: negative = pre-fire, 0 = ignition day, positive = active fire
 - `gis_acres` — **dependent variable**: final fire size in acres
 
----
-
 ## Pipeline
 
 To reproduce the dataset from raw data:
 
+### Step 1 — Download raw data
+
+**Automated:**
 ```bash
-# 1. Download raw weather data
 python "Data Processing/Scripts for downloading data/download_gridMET.py"
 python "Data Processing/Scripts for downloading data/download_DEMS.py"
+```
 
-# 2. Build individual fire time series (one CSV per fire)
+**Manual downloads:**
+- [NLCD Land Cover](https://www.mrlc.gov/viewer/) — download annual files for 1995–2024
+- [CAL FIRE Perimeters](https://www.fire.ca.gov/what-we-do/fire-resource-assessment-program) — download historical fire perimeters GeoPackage
+
+### Step 2 — Build individual fire time series
+```bash
 python "Data Processing/Scripts for building a time series csv/build_fire_timeseries_fast.py" --lag 365
+```
 
-# 3. Combine into one file
+### Step 3 — Combine into one file
+```bash
 python "Data Processing/Scripts for building a time series csv/combine_all_csv.py"
-
-
+```
